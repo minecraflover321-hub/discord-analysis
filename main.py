@@ -5,7 +5,7 @@ import json
 import os
 
 # ---------- CONFIG ----------
-TOKEN = "MTQ2ODExODIzMjQ3MTcwMzczNA.Gw7t3J.4ZKxb0RXiKnWwXJwMTKbSJuHT5tvexJrS6m__s"
+TOKEN = os.getenv("TOKEN")  # Render Environment Variable
 DATA_FILE = "data.json"
 CHECK_INTERVAL_MINUTES = 5
 CHANNEL_NAME = "general"
@@ -28,13 +28,6 @@ def save_data(data):
         json.dump(data, f, indent=4)
 
 data = load_data()
-# format:
-# {
-#   "username": {
-#       "status": "ACTIVE" / "BANNED" / "UNKNOWN",
-#       "watch": true
-#   }
-# }
 
 # ---------- INSTAGRAM CHECK ----------
 
@@ -54,6 +47,7 @@ def check_instagram(username):
 
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
 async def watcher():
+    await bot.wait_until_ready()
     for username, info in data.items():
         if not info.get("watch"):
             continue
@@ -68,20 +62,17 @@ async def watcher():
             info["status"] = new_status
             save_data(data)
 
-            channel = discord.utils.get(bot.get_all_channels(), name=CHANNEL_NAME)
-            if not channel:
-                continue
-
-            if new_status == "BANNED":
-                await channel.send(
-                    "Account Banned Successfully!\n"
-                    f"Username: {username}"
-                )
-            elif new_status == "ACTIVE":
-                await channel.send(
-                    "Account Unbanned Successfully!\n"
-                    f"Username: {username}"
-                )
+            for guild in bot.guilds:
+                channel = discord.utils.get(guild.text_channels, name=CHANNEL_NAME)
+                if channel:
+                    if new_status == "BANNED":
+                        await channel.send(
+                            f"🚫 Account Banned Successfully!\nUsername: {username}"
+                        )
+                    elif new_status == "ACTIVE":
+                        await channel.send(
+                            f"✅ Account Unbanned Successfully!\nUsername: {username}"
+                        )
 
 # ---------- EVENTS ----------
 
@@ -102,7 +93,7 @@ async def watch(ctx, username: str):
         data[username]["watch"] = True
 
     save_data(data)
-    await ctx.send(f"Now watching: {username}")
+    await ctx.send(f"👀 Now watching: {username}")
 
 @bot.command()
 async def unwatch(ctx, username: str):
@@ -110,16 +101,16 @@ async def unwatch(ctx, username: str):
     if username in data:
         data[username]["watch"] = False
         save_data(data)
-        await ctx.send(f"Stopped watching: {username}")
+        await ctx.send(f"🛑 Stopped watching: {username}")
     else:
-        await ctx.send("Username not found")
+        await ctx.send("❌ Username not found")
 
 @bot.command()
 async def status(ctx, username: str):
     username = username.lower()
     info = data.get(username)
     if not info:
-        await ctx.send("No record found")
+        await ctx.send("❌ No record found")
     else:
         await ctx.send(
             f"Username: {username}\n"
@@ -127,5 +118,7 @@ async def status(ctx, username: str):
             f"Watching: {info['watch']}"
         )
 
-bot.run(TOKEN)
+if not TOKEN:
+    raise ValueError("TOKEN not found! Set it in Render Environment Variables.")
 
+bot.run(TOKEN)
