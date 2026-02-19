@@ -6,7 +6,10 @@ from flask import Flask
 
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN")  # Discord bot token
-OWNER_ID = int(os.environ.get("OWNER_ID"))
+OWNER_ID = os.environ.get("OWNER_ID")  # Discord numeric ID
+if OWNER_ID is None:
+    raise ValueError("OWNER_ID environment variable not set!")
+OWNER_ID = int(OWNER_ID)
 DATA_FILE = "data.json"
 CHECK_INTERVAL_MINUTES = 5
 DEFAULT_CHANNEL_NAME = "general"
@@ -43,11 +46,13 @@ def instagram_exists(username):
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200 and "Sorry, this page isn't available" not in r.text:
+        # Reliable check: user exists if not "page isn't available"
+        if r.status_code == 200:
+            if "Sorry, this page isn't available" in r.text:
+                return False
             return True
-        else:
-            return False
-    except:
+        return False
+    except requests.exceptions.RequestException:
         return False
 
 def check_instagram(username):
@@ -55,11 +60,12 @@ def check_instagram(username):
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200 and "Sorry, this page isn't available" not in r.text:
+        if r.status_code == 200:
+            if "Sorry, this page isn't available" in r.text:
+                return "BANNED"
             return "ACTIVE"
-        else:
-            return "BANNED"
-    except:
+        return "ERROR"
+    except requests.exceptions.RequestException:
         return "ERROR"
 
 # ================= WATCHER TASK =================
@@ -91,7 +97,7 @@ async def on_ready():
     if not watcher.is_running():
         watcher.start()
 
-# ================= COMMANDS =================
+# ================= BOT COMMANDS =================
 @bot.command()
 async def watch(ctx, username: str):
     username = username.lower()
@@ -152,7 +158,12 @@ async def setchannel(ctx, channel_name: str):
     alert_channel_name = channel_name
     await ctx.send(f"Alert channel set to: {alert_channel_name}")
 
-# ================= RUN BOT + FLASK =================
+# Optional: Check your own Discord ID
+@bot.command()
+async def myid(ctx):
+    await ctx.send(f"Your Discord ID: {ctx.author.id}")
+
+# ================= RUN FLASK + BOT =================
 def run_flask():
     flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
