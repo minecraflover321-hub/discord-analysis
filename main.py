@@ -1,171 +1,174 @@
-# bot.py
-import discord
-from discord.ext import commands, tasks
-import requests, json, os, threading
-from flask import Flask
+import os
+import time
+import sqlite3
+import random
+import requests
+import threading
+from datetime import datetime
+from telegram.ext import Updater, CommandHandler
 
 # ================= CONFIG =================
-TOKEN = os.environ.get("TOKEN")  # Discord bot token
-OWNER_ID = os.environ.get("OWNER_ID")  # Discord numeric ID
-if OWNER_ID is None:
-    raise ValueError("OWNER_ID environment variable not set!")
-OWNER_ID = int(OWNER_ID)
-DATA_FILE = "data.json"
-CHECK_INTERVAL_MINUTES = 5
-DEFAULT_CHANNEL_NAME = "general"
+TOKEN = os.getenv("BOT_TOKEN")
+CHECK_INTERVAL = 300  # 5 minutes
+# ==========================================
 
-# ================= BOT SETUP =================
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+if not TOKEN:
+    raise ValueError("BOT_TOKEN not set in environment variables.")
 
-# ================= FLASK =================
-flask_app = Flask(__name__)
+# ================= DATABASE =================
+conn = sqlite3.connect("monitor.db", check_same_thread=False)
+cursor = conn.cursor()
 
-@flask_app.route("/")
-def home():
-    return "Bot is alive ✅"
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    status TEXT,
+    chat_id INTEGER
+)
+""")
+conn.commit()
 
-# ================= DATA HANDLING =================
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+# ================= PROXY POOL =================
+PROXIES = [
+    None,
+    # "http://user:pass@ip:port"
+]
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+def get_proxy():
+    proxy = random.choice(PROXIES)
+    if proxy:
+        return {"http": proxy, "https": proxy}
+    return None
 
-data = load_data()
-alert_channel_name = DEFAULT_CHANNEL_NAME
-
-# ================= INSTAGRAM FUNCTIONS =================
-def instagram_exists(username):
-    url = f"https://www.instagram.com/{username}/"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        # Reliable check: user exists if not "page isn't available"
-        if r.status_code == 200:
-            if "Sorry, this page isn't available" in r.text:
-                return False
-            return True
-        return False
-    except requests.exceptions.RequestException:
-        return False
-
+# ================= INSTAGRAM CHECK =================
 def check_instagram(username):
     url = f"https://www.instagram.com/{username}/"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+
     try:
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(
+            url,
+            headers=headers,
+            proxies=get_proxy(),
+            timeout=10
+        )
+
         if r.status_code == 200:
             if "Sorry, this page isn't available" in r.text:
                 return "BANNED"
             return "ACTIVE"
-        return "ERROR"
-    except requests.exceptions.RequestException:
-        return "ERROR"
 
-# ================= WATCHER TASK =================
-@tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
-async def watcher():
-    for username, info in data.items():
-        if not info.get("watch"):
-            continue
-        old_status = info.get("status", "UNKNOWN")
-        new_status = check_instagram(username)
-        if new_status == "ERROR":
-            continue
-        if new_status != old_status:
-            info["status"] = new_status
-            save_data(data)
-            # Send alert in selected channel
-            channel = discord.utils.get(bot.get_all_channels(), name=alert_channel_name)
-            if not channel:
+        if r.status_code == 404:
+            return "BANNED"
+
+    except requests.RequestException:
+        return "UNKNOWN"
+
+    return "UNKNOWN"
+
+# ================= COMMANDS =================
+def watch(update, context):
+    if not context.args:
+        update.message.reply_text("Usage: /watch username")
+        return
+
+    username = context.args[0].lower()
+    chat_id = update.effective_chat.id
+
+    cursor.execute(
+        "INSERT OR REPLACE INTO users VALUES (?, ?, ?)",
+        (username, "UNKNOWN", chat_id)
+    )
+    conn.commit()
+
+    update.message.reply_text(f"🔍 Now monitoring: {username}")
+
+def unwatch(update, context):
+    if not context.args:
+        update.message.reply_text("Usage: /unwatch username")
+        return
+
+    username = context.args[0].lower()
+
+    cursor.execute("DELETE FROM users WHERE username=?", (username,))
+    conn.commit()
+
+    update.message.reply_text(f"❌ Stopped monitoring: {username}")
+
+def list_users(update, context):
+    cursor.execute("SELECT username, status FROM users WHERE chat_id=?",
+                   (update.effective_chat.id,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        update.message.reply_text("No usernames added.")
+        return
+
+    msg = "📊 Monitoring List:\n\n"
+    for u, s in rows:
+        msg += f"• {u} → {s}\n"
+
+    update.message.reply_text(msg)
+
+# ================= MONITOR LOOP =================
+def monitor_loop(bot):
+    while True:
+        cursor.execute("SELECT username, status, chat_id FROM users")
+        rows = cursor.fetchall()
+
+        for username, old_status, chat_id in rows:
+            new_status = check_instagram(username)
+
+            if new_status == "UNKNOWN":
                 continue
-            if new_status == "BANNED":
-                await channel.send(f"❌ Account Banned!\nUsername: {username}")
-            elif new_status == "ACTIVE" and old_status == "BANNED":
-                await channel.send(f"✅ Account Unbanned!\nUsername: {username}")
 
-# ================= BOT EVENTS =================
-@bot.event
-async def on_ready():
-    print(f"Bot online as {bot.user}")
-    if not watcher.is_running():
-        watcher.start()
+            if new_status != old_status:
+                cursor.execute(
+                    "UPDATE users SET status=? WHERE username=?",
+                    (new_status, username)
+                )
+                conn.commit()
 
-# ================= BOT COMMANDS =================
-@bot.command()
-async def watch(ctx, username: str):
-    username = username.lower()
-    if not instagram_exists(username):
-        await ctx.send(f"❌ Username '{username}' does not exist or is invalid.")
-        return
-    status = check_instagram(username)
-    if username not in data:
-        data[username] = {"status": status, "watch": True}
-    else:
-        data[username]["watch"] = True
-        data[username]["status"] = status
-    save_data(data)
-    await ctx.send(f"✅ Now watching: {username} (Status: {status})")
+                alert = f"""
+🚨 INSTAGRAM STATUS CHANGE
 
-@bot.command()
-async def unwatch(ctx, username: str):
-    username = username.lower()
-    if username in data:
-        data[username]["watch"] = False
-        save_data(data)
-        await ctx.send(f"Stopped watching: {username}")
-    else:
-        await ctx.send("Username not found in watch list.")
+👤 Username: {username}
+📊 Previous: {old_status}
+📌 Current: {new_status}
+⏰ {datetime.now().strftime('%d %b %Y | %I:%M %p')}
 
-@bot.command()
-async def status(ctx, username: str):
-    username = username.lower()
-    info = data.get(username)
-    if not info:
-        await ctx.send("No record found")
-    else:
-        await ctx.send(
-            f"Username: {username}\nStatus: {info['status']}\nWatching: {info['watch']}"
-        )
+━━━━━━━━━━━━━━━━
+⚡ Powered by @proxyfxc
+"""
+                try:
+                    bot.send_message(chat_id=chat_id, text=alert)
+                except:
+                    pass
 
-@bot.command()
-async def list(ctx):
-    msg = "Watched accounts:\n"
-    for i, (username, info) in enumerate(data.items(), 1):
-        msg += f"{i}. {username} - {info['status']} - Watching: {info['watch']}\n"
-    await ctx.send(msg or "No accounts being watched.")
+        time.sleep(CHECK_INTERVAL)
 
-@bot.command()
-async def admin(ctx):
-    if ctx.author.id != OWNER_ID:
-        await ctx.send("You are not authorized to use this command.")
-        return
-    msg = f"Admin Panel\nTotal accounts watched: {len(data)}"
-    await ctx.send(msg)
+# ================= MAIN =================
+def main():
+    print("Bot starting on Render...")
 
-@bot.command()
-async def setchannel(ctx, channel_name: str):
-    global alert_channel_name
-    if ctx.author.id != OWNER_ID:
-        await ctx.send("You are not authorized to set the alert channel.")
-        return
-    alert_channel_name = channel_name
-    await ctx.send(f"Alert channel set to: {alert_channel_name}")
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-# Optional: Check your own Discord ID
-@bot.command()
-async def myid(ctx):
-    await ctx.send(f"Your Discord ID: {ctx.author.id}")
+    dp.add_handler(CommandHandler("watch", watch))
+    dp.add_handler(CommandHandler("unwatch", unwatch))
+    dp.add_handler(CommandHandler("list", list_users))
 
-# ================= RUN FLASK + BOT =================
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    threading.Thread(
+        target=monitor_loop,
+        args=(updater.bot,),
+        daemon=True
+    ).start()
 
-threading.Thread(target=run_flask).start()
-bot.run(TOKEN)
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
