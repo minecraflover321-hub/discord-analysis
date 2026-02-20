@@ -1,22 +1,20 @@
 import os
-import time
+import asyncio
 import sqlite3
 import random
 import requests
-import threading
 from datetime import datetime
-from telegram.ext import Updater, CommandHandler
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ================= CONFIG =================
 TOKEN = os.getenv("BOT_TOKEN")
 CHECK_INTERVAL = 300  # 5 minutes
-# ==========================================
 
 if not TOKEN:
-    raise ValueError("BOT_TOKEN not set in environment variables.")
+    raise ValueError("BOT_TOKEN not set in environment.")
 
 # ================= DATABASE =================
-conn = sqlite3.connect("monitor.db", check_same_thread=False)
+conn = sqlite3.connect("monitor.db")
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -31,7 +29,6 @@ conn.commit()
 # ================= PROXY POOL =================
 PROXIES = [
     None,
-    # "http://user:pass@ip:port"
 ]
 
 def get_proxy():
@@ -43,18 +40,10 @@ def get_proxy():
 # ================= INSTAGRAM CHECK =================
 def check_instagram(username):
     url = f"https://www.instagram.com/{username}/"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     try:
-        r = requests.get(
-            url,
-            headers=headers,
-            proxies=get_proxy(),
-            timeout=10
-        )
+        r = requests.get(url, headers=headers, proxies=get_proxy(), timeout=10)
 
         if r.status_code == 200:
             if "Sorry, this page isn't available" in r.text:
@@ -64,15 +53,15 @@ def check_instagram(username):
         if r.status_code == 404:
             return "BANNED"
 
-    except requests.RequestException:
+    except:
         return "UNKNOWN"
 
     return "UNKNOWN"
 
 # ================= COMMANDS =================
-def watch(update, context):
+async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        update.message.reply_text("Usage: /watch username")
+        await update.message.reply_text("Usage: /watch username")
         return
 
     username = context.args[0].lower()
@@ -84,37 +73,38 @@ def watch(update, context):
     )
     conn.commit()
 
-    update.message.reply_text(f"🔍 Now monitoring: {username}")
+    await update.message.reply_text(f"🔍 Now monitoring: {username}")
 
-def unwatch(update, context):
+async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        update.message.reply_text("Usage: /unwatch username")
+        await update.message.reply_text("Usage: /unwatch username")
         return
 
     username = context.args[0].lower()
-
     cursor.execute("DELETE FROM users WHERE username=?", (username,))
     conn.commit()
 
-    update.message.reply_text(f"❌ Stopped monitoring: {username}")
+    await update.message.reply_text(f"❌ Stopped monitoring: {username}")
 
-def list_users(update, context):
-    cursor.execute("SELECT username, status FROM users WHERE chat_id=?",
-                   (update.effective_chat.id,))
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cursor.execute(
+        "SELECT username, status FROM users WHERE chat_id=?",
+        (update.effective_chat.id,)
+    )
     rows = cursor.fetchall()
 
     if not rows:
-        update.message.reply_text("No usernames added.")
+        await update.message.reply_text("No usernames added.")
         return
 
     msg = "📊 Monitoring List:\n\n"
     for u, s in rows:
         msg += f"• {u} → {s}\n"
 
-    update.message.reply_text(msg)
+    await update.message.reply_text(msg)
 
 # ================= MONITOR LOOP =================
-def monitor_loop(bot):
+async def monitor_loop(app):
     while True:
         cursor.execute("SELECT username, status, chat_id FROM users")
         rows = cursor.fetchall()
@@ -143,32 +133,21 @@ def monitor_loop(bot):
 ━━━━━━━━━━━━━━━━
 ⚡ Powered by @proxyfxc
 """
-                try:
-                    bot.send_message(chat_id=chat_id, text=alert)
-                except:
-                    pass
+                await app.bot.send_message(chat_id=chat_id, text=alert)
 
-        time.sleep(CHECK_INTERVAL)
+        await asyncio.sleep(CHECK_INTERVAL)
 
 # ================= MAIN =================
-def main():
-    print("Bot starting on Render...")
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
+    app.add_handler(CommandHandler("watch", watch))
+    app.add_handler(CommandHandler("unwatch", unwatch))
+    app.add_handler(CommandHandler("list", list_users))
 
-    dp.add_handler(CommandHandler("watch", watch))
-    dp.add_handler(CommandHandler("unwatch", unwatch))
-    dp.add_handler(CommandHandler("list", list_users))
+    app.create_task(monitor_loop(app))
 
-    threading.Thread(
-        target=monitor_loop,
-        args=(updater.bot,),
-        daemon=True
-    ).start()
-
-    updater.start_polling()
-    updater.idle()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
