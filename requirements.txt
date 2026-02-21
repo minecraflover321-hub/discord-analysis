@@ -1,3 +1,4 @@
-python-telegram-bot==13.15
-urllib3==1.26.18
-requests
+python-telegram-bot==20.8
+requests==2.31.0
+flask==3.0.2
+gunicorn==21.2.0
