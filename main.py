@@ -1,126 +1,86 @@
 import os
-import asyncio
-import sqlite3
-import random
+import telebot
 import requests
-from datetime import datetime
+import threading
+import time
 from flask import Flask
-from threading import Thread
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- FLASK FOR RENDER (To keep it alive) ---
-flask_app = Flask(__name__)
+# --- CONFIGURATION FROM ENV ---
+# Render pe "BOT_TOKEN" naam se variable banayein
+API_TOKEN = os.getenv('BOT_TOKEN')
+bot = telebot.TeleBot(API_TOKEN)
+app = Flask(__name__)
 
-@flask_app.route('/')
-def health_check():
-    return "Bot is running and healthy!", 200
+# Credits
+CREDITS = "@proxyfxc"
+monitoring_users = {} # Format: { 'username': 'status' }
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host='0.0.0.0', port=port)
+@app.route('/')
+def home():
+    return f"🔥 Bot is Active! | Powered by {CREDITS}"
 
-# --- CONFIG ---
-TOKEN = os.getenv("BOT_TOKEN")
-CHECK_INTERVAL = 300 
-
-if not TOKEN:
-    print("❌ Error: BOT_TOKEN not found in environment variables!")
-    exit(1)
-
-# --- DATABASE ---
-def init_db():
-    conn = sqlite3.connect("monitor.db", check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        username TEXT PRIMARY KEY,
-        status TEXT,
-        chat_id INTEGER
-    )
-    """)
-    conn.commit()
-    return conn
-
-db_conn = init_db()
-
-# --- INSTAGRAM LOGIC ---
-def check_instagram(username):
+# --- CORE LOGIC ---
+def check_status(username):
+    """Instagram status checker with proper headers"""
     url = f"https://www.instagram.com/{username}/"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
     }
     try:
-        # No proxy used here by default, add if needed
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            if "Sorry, this page isn't available" in r.text:
-                return "BANNED"
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
             return "ACTIVE"
-        if r.status_code == 404:
+        elif response.status_code == 404:
             return "BANNED"
-    except Exception as e:
-        print(f"Check Error for {username}: {e}")
-    return "UNKNOWN"
+        else:
+            return "LIMIT" # Instagram rate limit
+    except:
+        return "ERROR"
+
+def monitor_loop(chat_id):
+    while True:
+        for username in list(monitoring_users.keys()):
+            old_status = monitoring_users[username]
+            new_status = check_status(username)
+
+            if new_status == "BANNED" and old_status != "BANNED":
+                bot.send_message(chat_id, f"🚫 **BANNED SUCCESSFULLY**\n👤 User: @{username}\n⚡ Credits: {CREDITS}", parse_mode="Markdown")
+                monitoring_users[username] = "BANNED"
+            
+            elif new_status == "ACTIVE" and old_status == "BANNED":
+                bot.send_message(chat_id, f"✅ **UNBANNED SUCCESSFULLY**\n👤 User: @{username}\n⚡ Credits: {CREDITS}", parse_mode="Markdown")
+                monitoring_users[username] = "ACTIVE"
+            
+            # Rate limit se bachne ke liye delay
+            time.sleep(10) 
+        
+        time.sleep(60) # Har cycle ke baad 1 min ka gap
 
 # --- BOT COMMANDS ---
-async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /watch username")
-        return
-    user_to_watch = context.args[0].lower().replace("@", "")
-    cursor = db_conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO users (username, status, chat_id) VALUES (?, ?, ?)", 
-                   (user_to_watch, "UNKNOWN", update.effective_chat.id))
-    db_conn.commit()
-    await update.message.reply_text(f"✅ Monitoring started for: @{user_to_watch}")
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, f"✨ **Instagram Monitor Bot**\n\nSend `/watch username` to start.\n\nOwner: {CREDITS}", parse_mode="Markdown")
 
-async def list_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cursor = db_conn.cursor()
-    cursor.execute("SELECT username, status FROM users WHERE chat_id=?", (update.effective_chat.id,))
-    rows = cursor.fetchall()
-    if not rows:
-        await update.message.reply_text("List is empty.")
-        return
-    msg = "📊 **Monitoring List:**\n\n" + "\n".join([f"• @{u} -> {s}" for u, s in rows])
-    await update.message.reply_text(msg)
-
-# --- BACKGROUND MONITOR ---
-async def monitor_loop(application):
-    while True:
-        cursor = db_conn.cursor()
-        cursor.execute("SELECT username, status, chat_id FROM users")
-        users = cursor.fetchall()
+@bot.message_handler(commands=['watch'])
+def watch(message):
+    try:
+        user = message.text.split()[1].replace('@', '')
+        current = check_status(user)
+        monitoring_users[user] = current
         
-        for username, old_status, chat_id in users:
-            new_status = check_instagram(username)
-            if new_status != "UNKNOWN" and new_status != old_status:
-                cursor.execute("UPDATE users SET status=? WHERE username=?", (new_status, username))
-                db_conn.commit()
-                alert = f"🔔 **STATUS CHANGE**\n\n👤 User: @{username}\n📉 New Status: {new_status}\n⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
-                try:
-                    await application.bot.send_message(chat_id=chat_id, text=alert)
-                except Exception as e:
-                    print(f"Failed to send alert: {e}")
+        bot.send_message(message.chat.id, f"👀 Monitoring started for @{user}\nInitial Status: {current}\n\nCredits: {CREDITS}")
         
-        await asyncio.sleep(CHECK_INTERVAL)
+        # Start loop in background if not already running
+        if len(monitoring_users) == 1:
+            threading.Thread(target=monitor_loop, args=(message.chat.id,), daemon=True).start()
+    except IndexError:
+        bot.reply_to(message, "❌ Please provide a username: `/watch username`")
 
-# --- MAIN ---
+# --- EXECUTION ---
 if __name__ == "__main__":
-    # 1. Start Flask in background
-    Thread(target=run_flask, daemon=True).start()
-
-    # 2. Build Telegram App
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    # 3. Add Handlers
-    application.add_handler(CommandHandler("watch", watch))
-    application.add_handler(CommandHandler("list", list_all))
-
-    # 4. Start Background Task
-    loop = asyncio.get_event_loop()
-    loop.create_task(monitor_loop(application))
-
-    # 5. Start Polling
-    print("🚀 Bot is starting...")
-    application.run_polling()
+    # Flask for Render Port Binding
+    port = int(os.environ.get("PORT", 8080))
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)).start()
+    
+    print("Bot is polling...")
+    bot.infinity_polling()
